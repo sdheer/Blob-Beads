@@ -7,7 +7,7 @@ The log lives under the vault directory and is chmod 600.
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -42,7 +42,7 @@ def audit(event: str, details: Dict[str, Any] | None = None) -> None:
     """Write a JSON-lines audit record."""
     _setup_logger()
     entry: Dict[str, Any] = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "event": event,
     }
     if details:

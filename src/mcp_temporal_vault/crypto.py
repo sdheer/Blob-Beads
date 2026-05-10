@@ -20,19 +20,19 @@ import base64
 import logging
 import os
 from typing import Optional
+import hmac
+import json
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import hmac
-
 from mcp_temporal_vault.key_manager import get_vault_key
 
 logger = logging.getLogger(__name__)
 
-_NONCE_LEN = 12  # 96-bit nonce for AES-GCM (NIST SP 800-38D recommended)
+_NONCE_LEN = 12
+
 
 def sign_manifest(manifest_dict: dict, key: bytes) -> str:
     """Compute an HMAC-SHA256 signature for the manifest to detect tampering."""
-    import json
     # Sort keys to ensure deterministic serialization
     serialized = json.dumps(
         {k: {"sha256": v.sha256, "mime_type": v.mime_type, "size": getattr(v, "size", 0)} 

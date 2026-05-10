@@ -19,7 +19,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 import zstandard as zstd
 
@@ -145,7 +145,7 @@ def store_blob_staged(raw_bytes: bytes, project_id: Optional[str] = None) -> Pat
         
     return staging_file
 
-def commit_staging(staged_files: List[Path]) -> None:
+def commit_staging(staged_files: list) -> None:
     """Atomically moves staged files to their final hashbucket destination."""
     for staged_file in staged_files:
         if not staged_file.exists() or not staged_file.name:
