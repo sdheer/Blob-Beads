@@ -1,0 +1,30 @@
+# Environments
+venv/
+env/
+.env
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Testing & Coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Vault directories
+.mcp_vault/
+hashbucket/
+beads/
+staging/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
