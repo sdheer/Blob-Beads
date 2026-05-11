@@ -68,8 +68,9 @@ pytest tests/ -v
 All security-relevant actions (saving blobs, encryption, path fingerprinting, and prompt-injection detection) are automatically logged in JSON-lines format at `~/.mcp_vault/audit.log`.
 
 ## Temporal Vault Agent Rules - add to your IDE
-Use MCP temporal-vault tools to maintain work history:
-- Save checkpoints before major changes
-- Save observations after features/bugs
-- Checkout to revert on dead ends
-- Always descriptive summaries
+Use MCP temporal-vault tools to maintain work history and understand project evolution:
+- **Orientation:** Always call `list_states` when joining a project to read recent summaries, decisions, and todos to quickly regain context.
+- **Investigation:** Before fixing bugs or editing unfamiliar code, use `get_summary_delta` between a working and broken state (found via `list_states`) to pinpoint exactly which files were modified.
+- **Safety Checkpoints:** Call `save_state` before making major refactors or risky changes.
+- **Reversion:** Call `checkout_state` to immediately revert to a known good state if a coding experiment fails.
+- **Documentation:** Write highly descriptive summaries when saving states.
