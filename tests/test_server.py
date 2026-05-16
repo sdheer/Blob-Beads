@@ -7,8 +7,10 @@ the MCP transport layer) to verify end-to-end pipeline behaviour.
 
 import json
 import os
+import uuid
 import base64
-import time
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -65,7 +67,7 @@ async def test_save_state_returns_bead_id(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_save_state_invalid_project_id():
+async def test_save_state_invalid_project_id(isolated_env):
     """project_id with slashes or traversal chars should return INVALID_INPUT."""
     res = _parse(await call_tool("save_state", {
         "project_id": "../../evil",
@@ -75,7 +77,7 @@ async def test_save_state_invalid_project_id():
 
 
 @pytest.mark.asyncio
-async def test_save_state_response_is_valid_json():
+async def test_save_state_response_is_valid_json(isolated_env):
     """Tool responses must always be parseable JSON, even on error."""
     # Malformed input that would previously break f-string JSON
     res_text = (await call_tool("save_state", {
@@ -156,7 +158,7 @@ async def test_checkout_state_dirty_guard(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_checkout_state_not_found():
+async def test_checkout_state_not_found(isolated_env):
     res = _parse(await call_tool("checkout_state", {"bead_id": "no-such-bead"}))
     assert res["error"]["code"] == "BEAD_NOT_FOUND"
 
@@ -217,7 +219,7 @@ async def test_get_summary_delta_file_added(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_get_summary_delta_bead_not_found():
+async def test_get_summary_delta_bead_not_found(isolated_env):
     res = _parse(await call_tool("get_summary_delta", {
         "bead_a": "nonexistent-a",
         "bead_b": "nonexistent-b",
@@ -230,7 +232,7 @@ async def test_get_summary_delta_bead_not_found():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_unknown_tool_returns_error():
+async def test_unknown_tool_returns_error(isolated_env):
     res = _parse(await call_tool("no_such_tool", {}))
     assert res["error"]["code"] == "UNKNOWN_TOOL"
 
@@ -257,3 +259,114 @@ async def test_save_and_checkout_encrypted(isolated_env, monkeypatch):
     }))
     assert res["restored_bead_id"] == save1["bead_id"]
     assert (isolated_env / "secret.txt").read_text() == "classified content"
+
+
+# ---------------------------------------------------------------------------
+# gc_collect / squash_milestone / git_sha
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_gc_collect_tool(isolated_env):
+    res = _parse(await call_tool("gc_collect", {}))
+    assert res["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_squash_milestone_empty_project(isolated_env):
+    res = _parse(
+        await call_tool(
+            "squash_milestone",
+            {
+                "project_id": "noproj",
+                "first_bead_id": "x",
+                "last_bead_id": "y",
+                "milestone_summary": "ms",
+            },
+        )
+    )
+    assert res["error"]["code"] == "EMPTY_PROJECT"
+
+
+needs_git = pytest.mark.skipif(not shutil.which("git"), reason="git not on PATH")
+
+
+@needs_git
+@pytest.mark.asyncio
+async def test_save_state_sets_git_sha_on_clean_repo(isolated_env, monkeypatch):
+    """Vault dir must not live inside the git repo or status is dirty (untracked)."""
+    ext_root = isolated_env.parent / f"vault_git_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setattr(global_config, "vault_dir", ext_root / ".mcp_vault")
+
+    subprocess.run(["git", "init"], cwd=isolated_env, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@test"], cwd=isolated_env, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "t"], cwd=isolated_env, check=True)
+    (isolated_env / "tracked.txt").write_text("v1")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=isolated_env, check=True)
+    subprocess.run(["git", "commit", "-m", "m"], cwd=isolated_env, check=True)
+
+    await _do_save({"project_id": "gitproj", "summary": "clean snap"})
+    from mcp_temporal_vault.beads import get_last_bead
+
+    last = get_last_bead("gitproj")
+    assert last.git_sha is not None and len(last.git_sha) == 40
+
+
+@needs_git
+@pytest.mark.asyncio
+async def test_save_state_clears_git_sha_when_dirty(isolated_env, monkeypatch):
+    ext_root = isolated_env.parent / f"vault_dirty_{uuid.uuid4().hex[:8]}"
+    monkeypatch.setattr(global_config, "vault_dir", ext_root / ".mcp_vault")
+
+    subprocess.run(["git", "init"], cwd=isolated_env, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@test"], cwd=isolated_env, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "t"], cwd=isolated_env, check=True)
+    (isolated_env / "tracked.txt").write_text("v1")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=isolated_env, check=True)
+    subprocess.run(["git", "commit", "-m", "m"], cwd=isolated_env, check=True)
+
+    (isolated_env / "untracked.txt").write_text("dirty")
+
+    await _do_save({"project_id": "dirtyproj", "summary": "dirty snap"})
+    from mcp_temporal_vault.beads import get_last_bead
+
+    last = get_last_bead("dirtyproj")
+    assert last.git_sha is None
+
+
+@pytest.mark.asyncio
+async def test_squash_milestone_merges_beads(isolated_env):
+    (isolated_env / "a.py").write_text("a")
+    s1 = await _do_save({"project_id": "sq", "summary": "one", "decisions": ["d1"]})
+    (isolated_env / "a.py").write_text("b")
+    s2 = await _do_save(
+        {"project_id": "sq", "summary": "two", "todos": ["t1"], "decisions": ["d2"]}
+    )
+
+    res = _parse(
+        await call_tool(
+            "squash_milestone",
+            {
+                "project_id": "sq",
+                "first_bead_id": s1["bead_id"],
+                "last_bead_id": s2["bead_id"],
+                "milestone_summary": "Merged milestone",
+            },
+        )
+    )
+    assert res["beads_removed"] == 2
+    assert res["milestone_bead_id"]
+
+    from mcp_temporal_vault.beads import find_bead, iter_beads_forward
+
+    beads = list(iter_beads_forward("sq"))
+    assert len(beads) == 1
+    m = beads[0]
+    assert m.step_type == "milestone"
+    assert "Merged milestone" in m.summary
+    assert "d1" in m.decisions and "d2" in m.decisions
+    assert "t1" in m.todos
+    assert find_bead(s1["bead_id"]) is None

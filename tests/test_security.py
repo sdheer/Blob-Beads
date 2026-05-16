@@ -10,10 +10,11 @@ from mcp_temporal_vault.security import (
     SecurityError,
     assert_safe_path,
     fingerprint_cwd,
+    fingerprint_hybrid,
     is_ignored,
     scan_for_injection,
 )
-from mcp_temporal_vault.models import ManifestEntry
+from mcp_temporal_vault.models import Bead, ManifestEntry
 from mcp_temporal_vault.config import global_config
 
 
@@ -176,3 +177,31 @@ def test_project_id_with_slash():
     from mcp_temporal_vault.models import SaveStateInput
     with pytest.raises(Exception):
         SaveStateInput(project_id="evil/path", summary="bad")
+
+
+# ---------------------------------------------------------------------------
+# fingerprint_hybrid
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_hybrid_without_git_matches_plain(tmp_path, monkeypatch):
+    monkeypatch.setattr(global_config, "vault_dir", tmp_path / ".mcp_vault")
+    import hashlib
+
+    raw = b"z"
+    hx = hashlib.sha256(raw).hexdigest()
+    (tmp_path / "g.txt").write_bytes(raw)
+    bead = Bead(
+        bead_id="bid",
+        project_id="p",
+        parent_id=None,
+        timestamp=1,
+        step_type="checkpoint",
+        summary="s",
+        manifest={
+            "g.txt": ManifestEntry(sha256=hx, mime_type="text/plain", size=len(raw)),
+        },
+        git_sha=None,
+    )
+    assert fingerprint_hybrid(tmp_path, bead, None) is fingerprint_cwd(
+        tmp_path, bead.manifest
+    )

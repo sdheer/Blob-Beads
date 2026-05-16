@@ -10,8 +10,6 @@ JSON construction — to prevent malformed output when inputs contain quotes
 or braces.
 """
 
-from mcp_temporal_vault import audit
-from mcp_temporal_vault.crypto import get_vault_key
 import json
 import logging
 import mimetypes
@@ -35,8 +33,16 @@ from mcp_temporal_vault.beads import (
     get_last_bead,
     iter_beads_reverse,
 )
-from mcp_temporal_vault.cas import CASStorageError, read_blob, store_blob, store_blob_staged, commit_staging, clear_staging
+from mcp_temporal_vault.cas import CASStorageError, read_blob, store_blob_staged, commit_staging, clear_staging
 from mcp_temporal_vault.crypto import sign_manifest, verify_manifest
+from mcp_temporal_vault.git_bridge import (
+    cwd_inside_git_repo,
+    find_git_root,
+    get_head_sha,
+    git_checkout_detach,
+    is_clean_worktree,
+    tracked_paths_at_commit,
+)
 from mcp_temporal_vault.key_manager import get_vault_key
 from mcp_temporal_vault.config import global_config
 from mcp_temporal_vault.models import (
@@ -45,14 +51,17 @@ from mcp_temporal_vault.models import (
     GetSummaryDeltaInput,
     ManifestEntry,
     SaveStateInput,
+    SquashMilestoneInput,
 )
+from mcp_temporal_vault.quota import gc_collect as run_gc_collect
 from mcp_temporal_vault.security import (
     SecurityError,
     assert_safe_path,
-    fingerprint_cwd,
+    fingerprint_hybrid,
     is_ignored,
     scan_for_injection,
 )
+from mcp_temporal_vault.squash import SquashError, squash_milestone_range
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +172,43 @@ async def list_tools() -> List[Tool]:
                 "required": ["bead_a", "bead_b"],
             },
         ),
+        Tool(
+            name="squash_milestone",
+            description=(
+                "Replace an inclusive chronological span of beads with one milestone bead "
+                "(merged decisions/todos, manifest from tip). Optionally trim CAS manifest "
+                "entries reproducible from git at bead.git_sha and run GC."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "string", "maxLength": 128},
+                    "first_bead_id": {"type": "string"},
+                    "last_bead_id": {"type": "string"},
+                    "milestone_summary": {"type": "string", "maxLength": 8192},
+                    "prune_git_blobs": {"type": "boolean", "default": False},
+                    "step_type": {
+                        "type": "string",
+                        "enum": ["checkpoint", "decision", "observation", "todo_update", "milestone"],
+                        "default": "milestone",
+                    },
+                },
+                "required": [
+                    "project_id",
+                    "first_bead_id",
+                    "last_bead_id",
+                    "milestone_summary",
+                ],
+            },
+        ),
+        Tool(
+            name="gc_collect",
+            description=(
+                "Delete hashbucket blobs not referenced by any bead manifest across "
+                "all projects."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -193,6 +239,10 @@ async def call_tool(name: str, arguments: dict) -> List[TextContent]:
         return await _checkout_state(arguments)
     if name == "get_summary_delta":
         return await _get_summary_delta(arguments)
+    if name == "squash_milestone":
+        return await _squash_milestone(arguments)
+    if name == "gc_collect":
+        return await _gc_collect(arguments)
     return _err("UNKNOWN_TOOL", f"No tool named '{name}'")
 
 
@@ -255,9 +305,21 @@ async def _background_save_task(inp: SaveStateInput, cwd: Path, ignore_patterns:
 
         last_bead = await asyncio.to_thread(get_last_bead, inp.project_id)
         bead_id = str(uuid.uuid4())
-        
+
+        resolved_cwd = cwd.resolve()
+        repo_root = find_git_root(resolved_cwd)
+        git_sha_val = None
+        if (
+            repo_root is not None
+            and cwd_inside_git_repo(resolved_cwd, repo_root)
+            and is_clean_worktree(repo_root)
+        ):
+            git_sha_val = get_head_sha(repo_root)
+
         key = get_vault_key()
-        signature = await asyncio.to_thread(sign_manifest, manifest, key) if key else None
+        signature = (
+            await asyncio.to_thread(sign_manifest, manifest, key, git_sha_val) if key else None
+        )
 
         new_bead = Bead(
             bead_id=bead_id,
@@ -270,6 +332,7 @@ async def _background_save_task(inp: SaveStateInput, cwd: Path, ignore_patterns:
             todos=inp.todos,
             manifest=manifest,
             manifest_signature=signature,
+            git_sha=git_sha_val,
         )
 
         await asyncio.to_thread(commit_staging, staged_files)
@@ -328,14 +391,17 @@ async def _list_states(arguments: dict) -> List[TextContent]:
     for i, bead in enumerate(gen):
         if i >= 200:
             break
-        beads_list.append({
+        row = {
             "bead_id":    bead.bead_id,
             "parent_id":  bead.parent_id,
             "timestamp":  bead.timestamp,
             "step_type":  bead.step_type,
             "summary":    bead.summary,
             "file_count": len(bead.manifest),
-        })
+        }
+        if bead.git_sha:
+            row["git_sha"] = bead.git_sha
+        beads_list.append(row)
 
     beads_list.sort(key=lambda x: x["timestamp"], reverse=True)
     return _ok(beads_list)
@@ -361,23 +427,41 @@ async def _checkout_state(arguments: dict) -> List[TextContent]:
 
     key = get_vault_key()
     if target_bead.manifest_signature and key:
-        if not verify_manifest(target_bead.manifest, target_bead.manifest_signature, key):
+        if not verify_manifest(
+            target_bead.manifest,
+            target_bead.manifest_signature,
+            key,
+            target_bead.git_sha,
+        ):
             audit("MANIFEST_TAMPERED", {"bead_id": target_bead.bead_id})
             return _err("MANIFEST_TAMPERED", "Bead manifest signature verification failed")
 
     cwd = Path(os.getcwd())
-    if not inp.force and fingerprint_cwd(cwd, target_bead.manifest):
+    resolved_cwd = cwd.resolve()
+    repo_root = find_git_root(resolved_cwd)
+    git_repo_ctx = (
+        repo_root
+        if repo_root is not None and cwd_inside_git_repo(resolved_cwd, repo_root)
+        else None
+    )
+    hybrid_root = git_repo_ctx if target_bead.git_sha else None
+
+    if not inp.force and fingerprint_hybrid(cwd, target_bead, hybrid_root):
         return _err(
             "DIRTY_WORKING_DIR",
             "Untracked changes detected. Save first or pass force=true.",
         )
+
+    paths_expected = set(target_bead.manifest.keys())
+    if target_bead.git_sha and git_repo_ctx is not None:
+        paths_expected |= tracked_paths_at_commit(git_repo_ctx, target_bead.git_sha)
 
     ignore_patterns = global_config.get_project_ignore_patterns(cwd)
     files_removed = 0
     files_written = 0
     warnings: List[Dict] = []
 
-    # Remove tracked files absent from the target manifest
+    # Remove files not expected at this bead (CAS manifest and/or git tree)
     for root, dirs, files in os.walk(cwd):
         dirs[:] = [
             d for d in dirs
@@ -393,14 +477,23 @@ async def _checkout_state(arguments: dict) -> List[TextContent]:
                 continue
             if _is_in_vault(file_path):
                 continue
-            if rel_path not in target_bead.manifest:
+            if rel_path not in paths_expected:
                 try:
                     os.remove(file_path)
                     files_removed += 1
                 except OSError as exc:
                     logger.warning("Could not remove %s: %s", file_path, exc)
 
-    # Restore files from the target manifest
+    if target_bead.git_sha and git_repo_ctx is not None:
+        ok = await asyncio.to_thread(git_checkout_detach, git_repo_ctx, target_bead.git_sha)
+        if not ok:
+            audit("GIT_CHECKOUT_FAILED", {"bead_id": target_bead.bead_id})
+            return _err(
+                "GIT_CHECKOUT_FAILED",
+                "git checkout failed; ensure git is available and commit exists.",
+            )
+
+    # Restore CAS-backed manifest entries (subset after git pruning)
     for rel_path, entry in target_bead.manifest.items():
         try:
             target_path = assert_safe_path(cwd, rel_path)
@@ -500,6 +593,46 @@ async def _get_summary_delta(arguments: dict) -> List[TextContent]:
             "unchanged": files_unchanged,
         },
     })
+
+
+async def _squash_milestone(arguments: dict) -> List[TextContent]:
+    try:
+        inp = SquashMilestoneInput.model_validate(arguments)
+    except Exception as exc:
+        return _err("INVALID_INPUT", str(exc))
+
+    key = get_vault_key()
+    cwd = Path(os.getcwd())
+    try:
+        result = await asyncio.to_thread(
+            squash_milestone_range,
+            inp.project_id,
+            inp.first_bead_id,
+            inp.last_bead_id,
+            inp.milestone_summary,
+            cwd,
+            key,
+            inp.prune_git_blobs,
+            inp.step_type,
+        )
+    except SquashError as exc:
+        return _err(exc.code, str(exc))
+
+    if inp.prune_git_blobs:
+        await asyncio.to_thread(run_gc_collect)
+
+    audit(
+        "SQUASH_MILESTONE",
+        {"project_id": inp.project_id, "detail": result},
+    )
+    return _ok(result)
+
+
+async def _gc_collect(arguments: dict) -> List[TextContent]:
+    _ = arguments
+    await asyncio.to_thread(run_gc_collect)
+    audit("GC_COLLECT", {})
+    return _ok({"status": "ok"})
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ pip install -e .
 
 ## Security & Encryption Setup
 
-The vault uses AES-256-GCM encryption. The server **will refuse to start** until an encryption key is generated and stored securely.
+The vault uses AES-256-GCM encryption. The MCP server **requires** a configured key: every tool call fails with `MISSING_ENCRYPTION_KEY` until you set **`MCP_VAULT_KEY`** or create **`~/.mcp_vault/key`** as below (the process may still launch; tools stay blocked until the key exists).
 
 1. Create the secure vault directory:
 ```bash
@@ -79,7 +79,24 @@ The server automatically applies these patterns whenever you call `save_state` o
 Each project has a default storage quota of **1 GB**. This limit applies to the total size of unique blobs referenced by the project's beads. 
 
 - If a project exceeds this limit, `save_state` will fail with a `QUOTA_EXCEEDED` error.
-- You can use the `gc_collect` tool to delete blobs that are no longer referenced by any beads across all projects, reclaiming disk space.
+- Use the **`gc_collect`** MCP tool to delete blobs that are no longer referenced by any bead manifest across **all** projects (same logic as `mcp_temporal_vault.quota.gc_collect()`).
+
+## Semantic squash and git-linked pruning
+
+On **`save_state`**, if the workspace is inside a **clean** Git repo (empty `git status --porcelain`), the bead stores **`git_sha`** (40-character commit SHA-1). Dirty trees omit **`git_sha`** so pruning is never inferred incorrectly.
+
+The **`squash_milestone`** tool replaces an inclusive chronological range **`first_bead_id` … `last_bead_id`** with one **`milestone`** bead: merged **`decisions`** / **`todos`**, manifest from the **tip** bead of that range, and manifest signatures recomputed (HMAC includes optional **`git_sha`**).
+
+If **`prune_git_blobs`** is true and the tip bead has **`git_sha`**, manifest paths whose CAS hashes match **`git show <git_sha>:path`** are dropped; **`gc_collect`** runs afterward so orphan blobs can be removed.
+
+**`checkout_state`** runs **`git checkout --force <git_sha>`** at the repo root when **`git_sha`** is set, then restores remaining **CAS-only** manifest entries. Dirty-directory detection uses **`fingerprint_hybrid`** (CAS manifest plus tracked git paths at that commit).
+
+Requirements:
+
+- **`git`** on `PATH` for git-linked behavior (squash prune and hybrid checkout).
+- Keeping the **vault directory outside** your Git checkout avoids spurious dirty status from untracked vault files.
+
+Without Git, **`git_sha`** stays unset, pruning does not trim the manifest, and checkout stays CAS-only.
 
 ## Testing
 

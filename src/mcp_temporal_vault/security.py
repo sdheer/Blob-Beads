@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from mcp_temporal_vault.config import global_config
-from mcp_temporal_vault.models import ManifestEntry
+from mcp_temporal_vault.models import Bead, ManifestEntry
 
 
 class SecurityError(Exception):
@@ -167,3 +167,24 @@ def fingerprint_cwd(cwd: Path, target_manifest: Dict[str, ManifestEntry]) -> boo
         if path not in seen:
             return True
     return False
+
+
+def fingerprint_hybrid(cwd: Path, bead: Bead, repo_root: Optional[Path]) -> bool:
+    """
+    Return True if cwd is dirty vs target bead (CAS manifest and/or git snapshot).
+    When bead.git_sha is set and repo_root is provided, expand expected paths with
+    tracked files at that commit so trimmed manifests still fingerprint correctly.
+    """
+    if not bead.git_sha or repo_root is None:
+        return fingerprint_cwd(cwd, bead.manifest)
+
+    from mcp_temporal_vault.git_bridge import manifest_entry_at_commit, tracked_paths_at_commit
+
+    expanded: Dict[str, ManifestEntry] = dict(bead.manifest)
+    for rel_path in tracked_paths_at_commit(repo_root, bead.git_sha):
+        if rel_path in expanded:
+            continue
+        entry = manifest_entry_at_commit(repo_root, bead.git_sha, rel_path)
+        if entry is not None:
+            expanded[rel_path] = entry
+    return fingerprint_cwd(cwd, expanded)
