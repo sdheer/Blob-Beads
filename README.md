@@ -53,6 +53,34 @@ Add the following entry to your configuration:
 
 *Be sure to replace `/ABSOLUTE/PATH/TO/Blob-Beads/` with the actual path to where you cloned this repository.*
 
+## Ignoring Files (.vaultignore)
+
+To prevent bloating the vault with build artifacts, dependencies, and cache files, you can create a `.vaultignore` file in the root of your project. This file works similarly to a `.gitignore`.
+
+Common patterns to include in your `.vaultignore`:
+
+```text
+# Exclude build outputs and caches
+bin/
+obj/
+node_modules/
+.vs/
+*.dll
+*.pdb
+*.cache
+*.deps.json
+*.assets.json
+```
+
+The server automatically applies these patterns whenever you call `save_state` or `get_summary_delta`.
+
+## Storage Quota
+
+Each project has a default storage quota of **1 GB**. This limit applies to the total size of unique blobs referenced by the project's beads. 
+
+- If a project exceeds this limit, `save_state` will fail with a `QUOTA_EXCEEDED` error.
+- You can use the `gc_collect` tool to delete blobs that are no longer referenced by any beads across all projects, reclaiming disk space.
+
 ## Testing
 
 ```bash
